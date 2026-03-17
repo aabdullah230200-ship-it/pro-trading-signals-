@@ -1,573 +1,512 @@
+"""
+╔══════════════════════════════════════════════════════════╗
+║   PRO TRADING SIGNALS - محرك الإشارات الاحترافي          ║
+║   Multi-Timeframe | Smart Money | Snake Strategy         ║
+║   Real prices: Binance (free) + Yahoo Finance (free)     ║
+╚══════════════════════════════════════════════════════════╝
+"""
 from flask import Flask, render_template, jsonify, request
-import requests
-import pandas as pd
-import numpy as np
+import requests, pandas as pd, numpy as np
 from datetime import datetime
-import json
 
 app = Flask(__name__)
 
-# ============================================================
-# FREE PRICE DATA SOURCES (NO API KEY NEEDED)
-# ============================================================
+# ─────────────────────────────────────────────
+# 1.  مصادر الأسعار المجانية
+# ─────────────────────────────────────────────
+BINANCE_URL = "https://data-api.binance.vision/api/v3/klines"
 
-def get_binance_klines(symbol, interval='1h', limit=500):
-    """Fetch OHLCV from Binance - completely free, no key needed"""
+BINANCE_MAP = {"BTCUSD":"BTCUSDT","XAUUSD":"XAUUSDT","ETHUSD":"ETHUSDT"}
+YAHOO_MAP   = {
+    "EURUSD":"EURUSD=X","GBPUSD":"GBPUSD=X","USDJPY":"USDJPY=X",
+    "USDCHF":"USDCHF=X","AUDUSD":"AUDUSD=X","USDCAD":"USDCAD=X",
+    "NZDUSD":"NZDUSD=X","XAUUSD":"GC=F","BTCUSD":"BTC-USD",
+}
+YAHOO_IV = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m",
+            "1h":"1h","4h":"1h","1d":"1d"}
+HIGHER_TF = {"1m":"5m","5m":"15m","15m":"1h","30m":"1h","1h":"4h","4h":"1d","1d":"1d"}
+
+def _binance(symbol, interval, limit=600):
     try:
-        url = "https://data-api.binance.vision/api/v3/klines"
-        params = {'symbol': symbol, 'interval': interval, 'limit': limit}
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        df = pd.DataFrame(data, columns=[
-            'timestamp','open','high','low','close','volume',
-            'close_time','quote_vol','trades','taker_buy_base',
-            'taker_buy_quote','ignore'
-        ])
-        df['open']   = df['open'].astype(float)
-        df['high']   = df['high'].astype(float)
-        df['low']    = df['low'].astype(float)
-        df['close']  = df['close'].astype(float)
-        df['volume'] = df['volume'].astype(float)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
+        r = requests.get(BINANCE_URL,
+            params={"symbol":symbol,"interval":interval,"limit":limit},timeout=12)
+        raw = r.json()
+        if not isinstance(raw, list): return None
+        df = pd.DataFrame(raw, columns=[
+            "timestamp","open","high","low","close","volume",
+            "ct","qv","n","tbb","tbq","ig"])
+        for c in ["open","high","low","close","volume"]:
+            df[c] = df[c].astype(float)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        return df[["timestamp","open","high","low","close","volume"]]
     except Exception as e:
-        print(f"Binance error: {e}")
-        return None
+        print(f"[Binance] {e}"); return None
 
-def get_yahoo_klines(symbol, interval='1h', period='60d'):
-    """Fetch OHLCV from Yahoo Finance - free"""
+def _yahoo(symbol, interval, period):
     try:
         import yfinance as yf
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval)
+        df = yf.Ticker(symbol).history(period=period, interval=interval)
         df = df.reset_index()
         df.columns = [c.lower() for c in df.columns]
-        df.rename(columns={'datetime': 'timestamp', 'date': 'timestamp'}, inplace=True)
+        df.rename(columns={"datetime":"timestamp","date":"timestamp"}, inplace=True)
+        df = df[["timestamp","open","high","low","close","volume"]]
         return df
     except Exception as e:
-        print(f"Yahoo error: {e}")
-        return None
+        print(f"[Yahoo] {e}"); return None
 
-def get_price_data(pair, interval='1h'):
-    """Route to correct data source based on pair"""
-    binance_map = {
-        'BTCUSD': 'BTCUSDT',
-        'XAUUSD': 'XAUUSDT',
-        'ETHUSD': 'ETHUSDT',
-    }
-    yahoo_map = {
-        'EURUSD': 'EURUSD=X',
-        'GBPUSD': 'GBPUSD=X',
-        'USDJPY': 'USDJPY=X',
-        'USDCHF': 'USDCHF=X',
-        'AUDUSD': 'AUDUSD=X',
-        'USDCAD': 'USDCAD=X',
-        'NZDUSD': 'NZDUSD=X',
-        'XAUUSD': 'GC=F',
-        'BTCUSD': 'BTC-USD',
-    }
-    interval_yahoo = {
-        '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
-        '1h': '1h', '4h': '1h', '1d': '1d'
-    }
-    # Try Binance first for crypto/gold
-    if pair in binance_map:
-        df = get_binance_klines(binance_map[pair], interval)
-        if df is not None and len(df) > 50:
-            return df
-    # Fallback to Yahoo Finance
-    if pair in yahoo_map:
-        yf_interval = interval_yahoo.get(interval, '1h')
-        period = '7d' if interval in ['1m', '5m', '15m'] else '60d'
-        df = get_yahoo_klines(yahoo_map[pair], yf_interval, period)
-        if df is not None and len(df) > 50:
-            return df
+def fetch(pair, interval):
+    period = "7d" if interval in ["1m","5m","15m"] else "90d"
+    if pair in BINANCE_MAP:
+        df = _binance(BINANCE_MAP[pair], interval)
+        if df is not None and len(df) >= 60: return df
+    if pair in YAHOO_MAP:
+        df = _yahoo(YAHOO_MAP[pair], YAHOO_IV.get(interval,"1h"), period)
+        if df is not None and len(df) >= 60: return df
     return None
 
-# ============================================================
-# TECHNICAL INDICATORS ENGINE
-# ============================================================
+# ─────────────────────────────────────────────
+# 2.  حساب المؤشرات
+# ─────────────────────────────────────────────
+def ema(s, n):  return s.ewm(span=n, adjust=False).mean()
+def sma(s, n):  return s.rolling(n).mean()
 
-def calc_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+def rsi(s, n=14):
+    d = s.diff()
+    g = d.clip(lower=0).ewm(com=n-1, min_periods=n).mean()
+    l = (-d).clip(lower=0).ewm(com=n-1, min_periods=n).mean()
+    return 100 - 100/(1 + g/(l+1e-10))
 
-def calc_sma(series, period):
-    return series.rolling(window=period).mean()
+def macd(s, f=12, sl=26, sig=9):
+    m = ema(s,f) - ema(s,sl)
+    sg = ema(m, sig)
+    return m, sg, m-sg
 
-def calc_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
-    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+def atr(df, n=14):
+    h,l,c = df.high, df.low, df.close
+    tr = pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(1)
+    return tr.ewm(span=n, adjust=False).mean()
 
-def calc_macd(series, fast=12, slow=26, signal=9):
-    ema_fast = calc_ema(series, fast)
-    ema_slow = calc_ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = calc_ema(macd_line, signal)
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
+def vwap(df):
+    tp = (df.high + df.low + df.close)/3
+    return (tp * df.volume).cumsum() / (df.volume.cumsum() + 1e-10)
 
-def calc_atr(df, period=14):
-    high = df['high']
-    low = df['low']
-    close = df['close']
-    tr1 = high - low
-    tr2 = (high - close.shift()).abs()
-    tr3 = (low - close.shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
+def bollinger(s, n=20, k=2):
+    m = sma(s,n); sd = s.rolling(n).std()
+    return m+k*sd, m, m-k*sd
 
-def calc_vwap(df):
-    typical = (df['high'] + df['low'] + df['close']) / 3
-    vwap = (typical * df['volume']).cumsum() / df['volume'].cumsum()
-    return vwap
+def stochastic(df, k=14, d=3):
+    lo = df.low.rolling(k).min(); hi = df.high.rolling(k).max()
+    K = 100*(df.close-lo)/(hi-lo+1e-10)
+    return K, K.rolling(d).mean()
 
-def calc_bollinger(series, period=20, std_dev=2):
-    sma = calc_sma(series, period)
-    std = series.rolling(window=period).std()
-    upper = sma + std_dev * std
-    lower = sma - std_dev * std
-    return upper, sma, lower
-
-def calc_pivot_points(df):
-    """Classic Pivot Points from previous candle"""
-    prev = df.iloc[-2]
-    pivot = (prev['high'] + prev['low'] + prev['close']) / 3
-    r1 = 2 * pivot - prev['low']
-    r2 = pivot + (prev['high'] - prev['low'])
-    r3 = prev['high'] + 2 * (pivot - prev['low'])
-    s1 = 2 * pivot - prev['high']
-    s2 = pivot - (prev['high'] - prev['low'])
-    s3 = prev['low'] - 2 * (prev['high'] - pivot)
-    return {
-        'pivot': round(pivot, 5),
-        'r1': round(r1, 5), 'r2': round(r2, 5), 'r3': round(r3, 5),
-        's1': round(s1, 5), 's2': round(s2, 5), 's3': round(s3, 5)
-    }
-
-def detect_order_blocks(df, lookback=20):
-    """Smart Money Concept - Order Block Detection"""
-    blocks = []
-    for i in range(lookback, len(df) - 1):
-        candle = df.iloc[i]
-        next_c = df.iloc[i + 1]
-        body = abs(candle['close'] - candle['open'])
-        candle_range = candle['high'] - candle['low']
-        if candle_range == 0:
-            continue
-        body_ratio = body / candle_range
-        # Bullish OB: bearish candle followed by strong bullish impulse
-        if (candle['close'] < candle['open'] and
-                next_c['close'] > next_c['open'] and
-                body_ratio > 0.5 and
-                (next_c['close'] - next_c['open']) > body * 1.5):
-            blocks.append({
-                'type': 'bullish_ob',
-                'high': round(float(candle['high']), 5),
-                'low': round(float(candle['low']), 5),
-                'index': i
-            })
-        # Bearish OB: bullish candle followed by strong bearish impulse
-        if (candle['close'] > candle['open'] and
-                next_c['close'] < next_c['open'] and
-                body_ratio > 0.5 and
-                (next_c['open'] - next_c['close']) > body * 1.5):
-            blocks.append({
-                'type': 'bearish_ob',
-                'high': round(float(candle['high']), 5),
-                'low': round(float(candle['low']), 5),
-                'index': i
-            })
-    return blocks[-5:] if blocks else []
-
-def snake_strategy(df):
-    """
-    SNAKE STRATEGY - استراتيجية الثعبان
-    EMA9 x EMA21 crossover + RSI confirmation + EMA50 trend filter
-    """
-    ema9  = calc_ema(df['close'], 9)
-    ema21 = calc_ema(df['close'], 21)
-    ema50 = calc_ema(df['close'], 50)
-    rsi   = calc_rsi(df['close'], 14)
-    signals = []
-    for i in range(22, len(df)):
-        prev_above = ema9.iloc[i - 1] > ema21.iloc[i - 1]
-        curr_above = ema9.iloc[i] > ema21.iloc[i]
-        if not prev_above and curr_above:
-            strength = 'strong' if (rsi.iloc[i] > 45 and df['close'].iloc[i] > ema50.iloc[i]) else 'weak'
-            signals.append({'index': i, 'signal': 'SNAKE_BUY', 'strength': strength})
-        elif prev_above and not curr_above:
-            strength = 'strong' if (rsi.iloc[i] < 55 and df['close'].iloc[i] < ema50.iloc[i]) else 'weak'
-            signals.append({'index': i, 'signal': 'SNAKE_SELL', 'strength': strength})
-    return signals
-
-def calc_supertrend(df, period=10, multiplier=3):
-    atr = calc_atr(df, period)
-    hl2 = (df['high'] + df['low']) / 2
-    upper = hl2 + multiplier * atr
-    lower = hl2 - multiplier * atr
-    supertrend = pd.Series(index=df.index, dtype=float)
-    direction  = pd.Series(index=df.index, dtype=int)
+def supertrend(df, n=10, m=3):
+    a = atr(df, n)
+    hl2 = (df.high+df.low)/2
+    ub = hl2 + m*a; lb = hl2 - m*a
+    st  = pd.Series(np.nan, index=df.index)
+    dir = pd.Series(0,     index=df.index)
     for i in range(1, len(df)):
-        if df['close'].iloc[i] > upper.iloc[i - 1]:
-            direction.iloc[i] = 1
-        elif df['close'].iloc[i] < lower.iloc[i - 1]:
-            direction.iloc[i] = -1
-        else:
-            direction.iloc[i] = direction.iloc[i - 1] if not pd.isna(direction.iloc[i - 1]) else 0
-        supertrend.iloc[i] = lower.iloc[i] if direction.iloc[i] == 1 else upper.iloc[i]
-    return supertrend, direction
+        prev = st.iloc[i-1] if not np.isnan(st.iloc[i-1]) else lb.iloc[i]
+        if df.close.iloc[i] > ub.iloc[i-1]: dir.iloc[i]=1
+        elif df.close.iloc[i] < lb.iloc[i-1]: dir.iloc[i]=-1
+        else: dir.iloc[i]=dir.iloc[i-1]
+        st.iloc[i] = lb.iloc[i] if dir.iloc[i]==1 else ub.iloc[i]
+    return st, dir
 
-def detect_market_structure(df):
-    """Detect Higher Highs / Lower Lows for trend structure"""
-    highs = df['high'].values
-    lows  = df['low'].values
-    n = len(highs)
-    if n < 10:
-        return 'UNKNOWN'
-    recent_highs = highs[-10:]
-    recent_lows  = lows[-10:]
-    hh = recent_highs[-1] > recent_highs[-5]
-    hl = recent_lows[-1]  > recent_lows[-5]
-    lh = recent_highs[-1] < recent_highs[-5]
-    ll = recent_lows[-1]  < recent_lows[-5]
-    if hh and hl:
-        return 'UPTREND (HH+HL)'
-    elif lh and ll:
-        return 'DOWNTREND (LH+LL)'
-    else:
-        return 'RANGING'
+def pivot_points(df):
+    p = df.iloc[-2]
+    pp = (p.high+p.low+p.close)/3
+    return dict(
+        pivot=round(pp,5),
+        r1=round(2*pp-p.low,5), r2=round(pp+(p.high-p.low),5),
+        r3=round(p.high+2*(pp-p.low),5),
+        s1=round(2*pp-p.high,5), s2=round(pp-(p.high-p.low),5),
+        s3=round(p.low-2*(p.high-pp),5))
 
-def calc_stochastic(df, k_period=14, d_period=3):
-    low_min  = df['low'].rolling(k_period).min()
-    high_max = df['high'].rolling(k_period).max()
-    k = 100 * (df['close'] - low_min) / (high_max - low_min + 1e-10)
-    d = k.rolling(d_period).mean()
-    return float(k.iloc[-1]), float(d.iloc[-1])
+def order_blocks(df, lb=30):
+    blocks=[]
+    for i in range(lb, len(df)-1):
+        c,nx = df.iloc[i], df.iloc[i+1]
+        body = abs(c.close-c.open)
+        rng  = c.high-c.low
+        if rng<1e-10: continue
+        br = body/rng
+        if c.close<c.open and nx.close>nx.open and br>0.5 and (nx.close-nx.open)>body*1.5:
+            blocks.append({"type":"bullish_ob","high":round(float(c.high),5),"low":round(float(c.low),5),"idx":i})
+        if c.close>c.open and nx.close<nx.open and br>0.5 and (nx.open-nx.close)>body*1.5:
+            blocks.append({"type":"bearish_ob","high":round(float(c.high),5),"low":round(float(c.low),5),"idx":i})
+    return blocks[-6:] if blocks else []
 
-# ============================================================
-# MAIN SIGNAL ENGINE
-# ============================================================
+def market_structure(df):
+    h = df.high.values[-20:]; l = df.low.values[-20:]
+    hh = h[-1]>h[-10]; hl = l[-1]>l[-10]
+    lh = h[-1]<h[-10]; ll = l[-1]<l[-10]
+    if hh and hl: return "UPTREND 📈 (HH+HL)"
+    if lh and ll: return "DOWNTREND 📉 (LH+LL)"
+    return "RANGING ↔️"
 
-def generate_signal(pair, interval='1h'):
-    df = get_price_data(pair, interval)
-    if df is None or len(df) < 50:
-        return {'error': f'Could not fetch data for {pair}. Please try again.'}
+def candle_pattern(c, prev):
+    body  = abs(c.close-c.open)
+    rng   = c.high-c.low
+    if rng<1e-10: return "Doji"
+    br = body/rng
+    bull = c.close>c.open
+    uw = c.high - max(c.open,c.close)
+    lw = min(c.open,c.close) - c.low
+    # engulfing
+    if bull and c.open<prev.close and c.close>prev.open and prev.close<prev.open:
+        return "🔥 Bullish Engulfing"
+    if not bull and c.open>prev.close and c.close<prev.open and prev.close>prev.open:
+        return "💀 Bearish Engulfing"
+    if br<0.08: return "⚪ Doji (تردد)"
+    if br>0.75: return ("🟢 Marubozu صعودي" if bull else "🔴 Marubozu هبوطي")
+    if lw>body*2 and br<0.4: return ("🔨 Hammer ارتداد" if bull else "🔨 Hammer")
+    if uw>body*2 and br<0.4: return "🌠 Shooting Star هبوط"
+    if br>0.4: return ("🟢 Candle صعودية" if bull else "🔴 Candle هبوطية")
+    return "↔️ Spinning Top"
 
-    # Ensure enough data
+# ─────────────────────────────────────────────
+# 3.  استراتيجية الثعبان
+# ─────────────────────────────────────────────
+def snake_strategy(df):
+    e9  = ema(df.close,9)
+    e21 = ema(df.close,21)
+    e50 = ema(df.close,50)
+    rs  = rsi(df.close,14)
+    sigs=[]
+    for i in range(22,len(df)):
+        pa = e9.iloc[i-1]>e21.iloc[i-1]
+        ca = e9.iloc[i]  >e21.iloc[i]
+        if not pa and ca:
+            st = "strong" if rs.iloc[i]>45 and df.close.iloc[i]>e50.iloc[i] else "weak"
+            sigs.append({"i":i,"dir":"BUY","strength":st})
+        elif pa and not ca:
+            st = "strong" if rs.iloc[i]<55 and df.close.iloc[i]<e50.iloc[i] else "weak"
+            sigs.append({"i":i,"dir":"SELL","strength":st})
+    return sigs[-1] if sigs else None
+
+# ─────────────────────────────────────────────
+# 4.  محرك الإشارة الرئيسي — متعدد الإطارات
+# ─────────────────────────────────────────────
+def analyse_tf(df):
+    """إرجاع ملخص مؤشرات لإطار زمني واحد"""
+    if df is None or len(df)<50: return None
     df = df.tail(500).reset_index(drop=True)
-    close = df['close']
-    current_price = float(close.iloc[-1])
+    c = df.close
+    price = float(c.iloc[-1])
 
-    # ===== INDICATORS =====
-    ema9   = calc_ema(close, 9)
-    ema21  = calc_ema(close, 21)
-    ema50  = calc_ema(close, 50)
-    ema200 = calc_ema(close, min(200, len(df)-1))
-    rsi    = calc_rsi(close, 14)
-    macd_line, macd_signal_line, macd_hist = calc_macd(close)
-    atr    = calc_atr(df, 14)
-    vwap   = calc_vwap(df)
-    bb_upper, bb_mid, bb_lower = calc_bollinger(close)
-    supertrend, st_direction   = calc_supertrend(df)
+    e9  = ema(c,9);  e21 = ema(c,21)
+    e50 = ema(c,50); e200= ema(c,min(200,len(df)-1))
+    rs  = rsi(c,14)
+    ml,ms,mh = macd(c)
+    at  = atr(df,14)
+    vw  = vwap(df)
+    bbu,bbm,bbl = bollinger(c)
+    _,stdir = supertrend(df)
+    sk,sd = stochastic(df)
 
-    cur_rsi    = float(rsi.iloc[-1])
-    cur_macd   = float(macd_line.iloc[-1])
-    cur_macd_s = float(macd_signal_line.iloc[-1])
-    cur_macd_h = float(macd_hist.iloc[-1])
-    cur_atr    = float(atr.iloc[-1])
-    cur_vwap   = float(vwap.iloc[-1])
-    cur_ema200 = float(ema200.iloc[-1])
-    cur_ema50  = float(ema50.iloc[-1])
-    cur_ema21  = float(ema21.iloc[-1])
-    cur_ema9   = float(ema9.iloc[-1])
-    cur_bb_up  = float(bb_upper.iloc[-1])
-    cur_bb_low = float(bb_lower.iloc[-1])
-    cur_bb_mid = float(bb_mid.iloc[-1])
-    cur_st_dir = int(st_direction.iloc[-1]) if not pd.isna(st_direction.iloc[-1]) else 0
+    cur_rsi  = float(rs.iloc[-1])
+    cur_mh   = float(mh.iloc[-1])
+    cur_ml   = float(ml.iloc[-1])
+    cur_ms   = float(ms.iloc[-1])
+    cur_atr  = float(at.iloc[-1])
+    cur_vwap = float(vw.iloc[-1])
+    e200v    = float(e200.iloc[-1])
+    e50v     = float(e50.iloc[-1])
+    e21v     = float(e21.iloc[-1])
+    e9v      = float(e9.iloc[-1])
+    bbuv     = float(bbu.iloc[-1])
+    bblv     = float(bbl.iloc[-1])
+    bbmv     = float(bbm.iloc[-1])
+    stdir_v  = int(stdir.iloc[-1]) if not np.isnan(stdir.iloc[-1]) else 0
+    sk_v     = float(sk.iloc[-1])
+    sd_v     = float(sd.iloc[-1])
 
-    # Stochastic
-    stoch_k, stoch_d = calc_stochastic(df)
+    bull=0; bear=0; reasons=[]
 
-    # Market structure
-    market_structure = detect_market_structure(df)
-
-    # ===== CURRENT CANDLE ANALYSIS =====
-    cur_candle  = df.iloc[-1]
-    prev_candle = df.iloc[-2]
-    candle_body  = float(cur_candle['close']) - float(cur_candle['open'])
-    candle_range = float(cur_candle['high'])  - float(cur_candle['low'])
-    body_ratio   = abs(candle_body) / candle_range if candle_range > 0 else 0
-    is_bullish_candle = candle_body > 0
-    candle_strength = 'قوية' if body_ratio > 0.6 else ('متوسطة' if body_ratio > 0.35 else 'ضعيفة')
-
-    upper_wick = float(cur_candle['high']) - max(float(cur_candle['open']), float(cur_candle['close']))
-    lower_wick = min(float(cur_candle['open']), float(cur_candle['close'])) - float(cur_candle['low'])
-    wick_ratio = lower_wick / candle_range if candle_range > 0 else 0
-
-    # ===== SCORING SYSTEM =====
-    bull_score = 0
-    bear_score = 0
-    signals_list = []
-
-    # 1. EMA200 Trend Filter (20 pts)
-    if current_price > cur_ema200:
-        bull_score += 20
-        signals_list.append({'indicator': 'EMA200', 'signal': 'BULL', 'value': f'السعر فوق EMA200 ({round(cur_ema200, 4)})', 'icon': '📈'})
+    # EMA200 trend filter  — 25 pts
+    if price>e200v:
+        bull+=25; reasons.append({"ind":"EMA200","sig":"BULL","val":f"السعر فوق EMA200 ({e200v:.4f})","icon":"📈"})
     else:
-        bear_score += 20
-        signals_list.append({'indicator': 'EMA200', 'signal': 'BEAR', 'value': f'السعر تحت EMA200 ({round(cur_ema200, 4)})', 'icon': '📉'})
+        bear+=25; reasons.append({"ind":"EMA200","sig":"BEAR","val":f"السعر تحت EMA200 ({e200v:.4f})","icon":"📉"})
 
-    # 2. RSI (20 pts)
-    if cur_rsi < 30:
-        bull_score += 20
-        signals_list.append({'indicator': 'RSI', 'signal': 'STRONG BULL', 'value': f'ذروة البيع: {round(cur_rsi, 1)}', 'icon': '🔥'})
-    elif cur_rsi < 45:
-        bull_score += 10
-        signals_list.append({'indicator': 'RSI', 'signal': 'BULL', 'value': f'منطقة صعود: {round(cur_rsi, 1)}', 'icon': '📈'})
-    elif cur_rsi > 70:
-        bear_score += 20
-        signals_list.append({'indicator': 'RSI', 'signal': 'STRONG BEAR', 'value': f'ذروة الشراء: {round(cur_rsi, 1)}', 'icon': '⚠️'})
-    elif cur_rsi > 55:
-        bear_score += 10
-        signals_list.append({'indicator': 'RSI', 'signal': 'BEAR', 'value': f'منطقة هبوط: {round(cur_rsi, 1)}', 'icon': '📉'})
+    # EMA stack 9>21>50  — 20 pts
+    if e9v>e21v>e50v:
+        bull+=20; reasons.append({"ind":"EMA Stack","sig":"STRONG BULL","val":"EMA9>EMA21>EMA50 تراص صعودي","icon":"🚀"})
+    elif e9v<e21v<e50v:
+        bear+=20; reasons.append({"ind":"EMA Stack","sig":"STRONG BEAR","val":"EMA9<EMA21<EMA50 تراص هبوطي","icon":"💥"})
     else:
-        signals_list.append({'indicator': 'RSI', 'signal': 'NEUTRAL', 'value': f'محايد: {round(cur_rsi, 1)}', 'icon': '➖'})
+        reasons.append({"ind":"EMA Stack","sig":"NEUTRAL","val":"المتوسطات متباينة","icon":"➖"})
 
-    # 3. MACD (15 pts)
-    if cur_macd > cur_macd_s and cur_macd_h > 0:
-        bull_score += 15
-        signals_list.append({'indicator': 'MACD', 'signal': 'BULL', 'value': f'تقاطع صعودي، hist: {round(cur_macd_h, 5)}', 'icon': '📈'})
-    elif cur_macd < cur_macd_s and cur_macd_h < 0:
-        bear_score += 15
-        signals_list.append({'indicator': 'MACD', 'signal': 'BEAR', 'value': f'تقاطع هبوطي، hist: {round(cur_macd_h, 5)}', 'icon': '📉'})
+    # RSI  — 20 pts
+    if cur_rsi<28:
+        bull+=20; reasons.append({"ind":"RSI","sig":"STRONG BULL","val":f"تشبع بيع حاد {cur_rsi:.1f}","icon":"🔥"})
+    elif cur_rsi<42:
+        bull+=12; reasons.append({"ind":"RSI","sig":"BULL","val":f"منطقة صعود {cur_rsi:.1f}","icon":"📈"})
+    elif cur_rsi>72:
+        bear+=20; reasons.append({"ind":"RSI","sig":"STRONG BEAR","val":f"تشبع شراء حاد {cur_rsi:.1f}","icon":"⚠️"})
+    elif cur_rsi>58:
+        bear+=12; reasons.append({"ind":"RSI","sig":"BEAR","val":f"منطقة هبوط {cur_rsi:.1f}","icon":"📉"})
     else:
-        signals_list.append({'indicator': 'MACD', 'signal': 'NEUTRAL', 'value': f'في التقاطع، hist: {round(cur_macd_h, 5)}', 'icon': '➖'})
+        reasons.append({"ind":"RSI","sig":"NEUTRAL","val":f"محايد {cur_rsi:.1f}","icon":"➖"})
 
-    # 4. VWAP (10 pts)
-    if current_price > cur_vwap:
-        bull_score += 10
-        signals_list.append({'indicator': 'VWAP', 'signal': 'BULL', 'value': f'فوق VWAP ({round(cur_vwap, 4)})', 'icon': '📈'})
+    # MACD  — 15 pts
+    macd_prev_h = float(mh.iloc[-2])
+    if cur_ml>cur_ms and cur_mh>0 and cur_mh>macd_prev_h:
+        bull+=15; reasons.append({"ind":"MACD","sig":"BULL","val":f"تقاطع صعودي متسارع {cur_mh:.5f}","icon":"📈"})
+    elif cur_ml<cur_ms and cur_mh<0 and cur_mh<macd_prev_h:
+        bear+=15; reasons.append({"ind":"MACD","sig":"BEAR","val":f"تقاطع هبوطي متسارع {cur_mh:.5f}","icon":"📉"})
+    elif cur_ml>cur_ms:
+        bull+=7; reasons.append({"ind":"MACD","sig":"BULL","val":f"فوق الإشارة {cur_mh:.5f}","icon":"📈"})
+    elif cur_ml<cur_ms:
+        bear+=7; reasons.append({"ind":"MACD","sig":"BEAR","val":f"تحت الإشارة {cur_mh:.5f}","icon":"📉"})
     else:
-        bear_score += 10
-        signals_list.append({'indicator': 'VWAP', 'signal': 'BEAR', 'value': f'تحت VWAP ({round(cur_vwap, 4)})', 'icon': '📉'})
+        reasons.append({"ind":"MACD","sig":"NEUTRAL","val":f"في التقاطع {cur_mh:.5f}","icon":"➖"})
 
-    # 5. EMA Stack (15 pts)
-    if cur_ema9 > cur_ema21 > cur_ema50:
-        bull_score += 15
-        signals_list.append({'indicator': 'EMA Stack', 'signal': 'STRONG BULL', 'value': 'EMA9 > EMA21 > EMA50', 'icon': '🚀'})
-    elif cur_ema9 < cur_ema21 < cur_ema50:
-        bear_score += 15
-        signals_list.append({'indicator': 'EMA Stack', 'signal': 'STRONG BEAR', 'value': 'EMA9 < EMA21 < EMA50', 'icon': '💥'})
+    # VWAP  — 10 pts
+    if price>cur_vwap:
+        bull+=10; reasons.append({"ind":"VWAP","sig":"BULL","val":f"فوق VWAP {cur_vwap:.4f}","icon":"📈"})
     else:
-        signals_list.append({'indicator': 'EMA Stack', 'signal': 'NEUTRAL', 'value': 'تباين في المتوسطات', 'icon': '➖'})
+        bear+=10; reasons.append({"ind":"VWAP","sig":"BEAR","val":f"تحت VWAP {cur_vwap:.4f}","icon":"📉"})
 
-    # 6. Bollinger Bands (10 pts)
-    bb_range = cur_bb_up - cur_bb_low
-    bb_pos = (current_price - cur_bb_low) / bb_range if bb_range > 0 else 0.5
-    if current_price < cur_bb_low:
-        bull_score += 10
-        signals_list.append({'indicator': 'Bollinger', 'signal': 'BULL', 'value': 'تحت الشريط السفلي - ارتداد محتمل', 'icon': '🔄'})
-    elif current_price > cur_bb_up:
-        bear_score += 10
-        signals_list.append({'indicator': 'Bollinger', 'signal': 'BEAR', 'value': 'فوق الشريط العلوي - تصحيح محتمل', 'icon': '🔄'})
+    # Supertrend  — 15 pts
+    if stdir_v==1:
+        bull+=15; reasons.append({"ind":"Supertrend","sig":"BULL","val":"اتجاه صعودي مؤكد ✅","icon":"✅"})
+    elif stdir_v==-1:
+        bear+=15; reasons.append({"ind":"Supertrend","sig":"BEAR","val":"اتجاه هبوطي مؤكد ❌","icon":"❌"})
+
+    # Bollinger  — 10 pts
+    bb_rng = bbuv-bblv
+    bb_pct = (price-bblv)/bb_rng if bb_rng>0 else 0.5
+    if price<bblv:
+        bull+=10; reasons.append({"ind":"Bollinger","sig":"BULL","val":"تحت الشريط السفلي — ارتداد محتمل","icon":"🔄"})
+    elif price>bbuv:
+        bear+=10; reasons.append({"ind":"Bollinger","sig":"BEAR","val":"فوق الشريط العلوي — تصحيح محتمل","icon":"🔄"})
     else:
-        signals_list.append({'indicator': 'Bollinger', 'signal': 'NEUTRAL', 'value': f'موضع BB: {round(bb_pos*100, 1)}%', 'icon': '➖'})
+        reasons.append({"ind":"Bollinger","sig":"NEUTRAL","val":f"موضع {bb_pct*100:.0f}%","icon":"➖"})
 
-    # 7. Supertrend (10 pts)
-    if cur_st_dir == 1:
-        bull_score += 10
-        signals_list.append({'indicator': 'Supertrend', 'signal': 'BULL', 'value': 'اتجاه صعودي مؤكد', 'icon': '✅'})
-    elif cur_st_dir == -1:
-        bear_score += 10
-        signals_list.append({'indicator': 'Supertrend', 'signal': 'BEAR', 'value': 'اتجاه هبوطي مؤكد', 'icon': '❌'})
-
-    # 8. Stochastic (bonus)
-    if stoch_k < 20 and stoch_k > stoch_d:
-        bull_score += 5
-        signals_list.append({'indicator': 'Stochastic', 'signal': 'BULL', 'value': f'K={round(stoch_k,1)} تشبع بيع+تقاطع', 'icon': '📈'})
-    elif stoch_k > 80 and stoch_k < stoch_d:
-        bear_score += 5
-        signals_list.append({'indicator': 'Stochastic', 'signal': 'BEAR', 'value': f'K={round(stoch_k,1)} تشبع شراء+تقاطع', 'icon': '📉'})
+    # Stochastic  — 10 pts
+    if sk_v<20 and sk_v>sd_v:
+        bull+=10; reasons.append({"ind":"Stoch","sig":"BULL","val":f"K={sk_v:.1f} تشبع بيع + تقاطع صعودي","icon":"📈"})
+    elif sk_v>80 and sk_v<sd_v:
+        bear+=10; reasons.append({"ind":"Stoch","sig":"BEAR","val":f"K={sk_v:.1f} تشبع شراء + تقاطع هبوطي","icon":"📉"})
     else:
-        signals_list.append({'indicator': 'Stochastic', 'signal': 'NEUTRAL', 'value': f'K={round(stoch_k,1)} D={round(stoch_d,1)}', 'icon': '➖'})
+        reasons.append({"ind":"Stoch","sig":"NEUTRAL","val":f"K={sk_v:.1f} D={sd_v:.1f}","icon":"➖"})
 
-    # ===== FINAL SIGNAL =====
-    total = bull_score + bear_score
-    bull_pct = (bull_score / total * 100) if total > 0 else 50
-    bear_pct = (bear_score / total * 100) if total > 0 else 50
+    return {"bull":bull,"bear":bear,"reasons":reasons,
+            "price":price,"atr":cur_atr,"rsi":cur_rsi,
+            "e9":e9v,"e21":e21v,"e50":e50v,"e200":e200v,
+            "macd":cur_ml,"macd_sig":cur_ms,"macd_hist":cur_mh,
+            "vwap":cur_vwap,"bb_u":bbuv,"bb_m":bbmv,"bb_l":bblv,
+            "st_dir":stdir_v,"stoch_k":sk_v,"stoch_d":sd_v,
+            "df":df}
 
-    if bull_score >= bear_score + 20:
-        main_signal = 'BUY'
-        confidence = min(95, 50 + (bull_score - bear_score))
-    elif bear_score >= bull_score + 20:
-        main_signal = 'SELL'
-        confidence = min(95, 50 + (bear_score - bull_score))
+def generate_signal(pair, interval="1h"):
+    # ── جلب الإطار الرئيسي ──
+    df_main = fetch(pair, interval)
+    if df_main is None or len(df_main)<60:
+        return {"error":f"لا توجد بيانات كافية لـ {pair}. حاول مرة أخرى."}
+
+    main = analyse_tf(df_main)
+    if main is None:
+        return {"error":"فشل تحليل البيانات"}
+
+    # ── جلب الإطار الأعلى (تأكيد الاتجاه) ──
+    htf = HIGHER_TF.get(interval, "1d")
+    df_high = fetch(pair, htf)
+    higher = analyse_tf(df_high) if df_high is not None else None
+
+    price   = main["price"]
+    cur_atr = main["atr"]
+    reasons = main["reasons"]
+    df      = main["df"]
+
+    bull = main["bull"]
+    bear = main["bear"]
+
+    # ── تعزيز بالإطار الأعلى (25 pts إضافية) ──
+    htf_confirm = "غير متاح"
+    if higher:
+        htf_total = higher["bull"]+higher["bear"]
+        htf_bull_pct = higher["bull"]/htf_total*100 if htf_total>0 else 50
+        if htf_bull_pct>=60:
+            bull+=25; htf_confirm="صعود ✅"
+            reasons.append({"ind":f"HTF {htf.upper()}","sig":"BULL","val":f"الإطار الأعلى صعودي {htf_bull_pct:.0f}%","icon":"🔝"})
+        elif htf_bull_pct<=40:
+            bear+=25; htf_confirm="هبوط ✅"
+            reasons.append({"ind":f"HTF {htf.upper()}","sig":"BEAR","val":f"الإطار الأعلى هبوطي {100-htf_bull_pct:.0f}%","icon":"🔝"})
+        else:
+            htf_confirm="محايد ➖"
+            reasons.append({"ind":f"HTF {htf.upper()}","sig":"NEUTRAL","val":"الإطار الأعلى محايد","icon":"➖"})
+
+    # ── إشارة الثعبان (10 pts) ──
+    snake = snake_strategy(df)
+    snake_info = None
+    if snake:
+        if snake["dir"]=="BUY":
+            if snake["strength"]=="strong": bull+=10
+            else: bull+=5
+            snake_info={"dir":"BUY","strength":snake["strength"],"label":"🐍 ثعبان شراء"}
+        else:
+            if snake["strength"]=="strong": bear+=10
+            else: bear+=5
+            snake_info={"dir":"SELL","strength":snake["strength"],"label":"🐍 ثعبان بيع"}
+
+    # ── مؤشر الزخم المتفق عليه (حارس الجودة) ──
+    #   لا إشارة إلا إذا اتفق RSI + MACD + Supertrend
+    rsi_bull  = main["rsi"]<50
+    macd_bull = main["macd_hist"]>0
+    st_bull   = main["st_dir"]==1
+    rsi_bear  = main["rsi"]>50
+    macd_bear = main["macd_hist"]<0
+    st_bear   = main["st_dir"]==-1
+
+    agreement_bull = sum([rsi_bull, macd_bull, st_bull])   # 0-3
+    agreement_bear = sum([rsi_bear, macd_bear, st_bear])   # 0-3
+
+    # ── قرار الإشارة النهائي ──
+    total = bull+bear if bull+bear>0 else 1
+    bull_pct = bull/total*100
+    bear_pct = bear/total*100
+
+    # شرط الإشارة: فارق ≥ 20 نقطة + اتفاق ≥ 2 مؤشرات
+    if bull-bear>=20 and agreement_bull>=2:
+        signal="BUY"
+        confidence=min(95, 50 + (bull-bear)//2 + agreement_bull*3)
+        quality = "⭐⭐⭐ ممتازة" if bull-bear>=50 and agreement_bull==3 else \
+                  "⭐⭐ جيدة"  if bull-bear>=30 else "⭐ مقبولة"
+    elif bear-bull>=20 and agreement_bear>=2:
+        signal="SELL"
+        confidence=min(95, 50 + (bear-bull)//2 + agreement_bear*3)
+        quality = "⭐⭐⭐ ممتازة" if bear-bull>=50 and agreement_bear==3 else \
+                  "⭐⭐ جيدة"  if bear-bull>=30 else "⭐ مقبولة"
     else:
-        main_signal = 'HOLD'
-        confidence = 50
+        signal="WAIT"
+        confidence=50
+        quality="⏳ انتظر تأكيداً"
 
-    # ===== ENTRY / SL / TP (ATR-based) =====
-    atr_val = cur_atr
-    if main_signal == 'BUY':
-        entry = current_price
-        sl    = round(entry - 1.5 * atr_val, 5)
-        tp1   = round(entry + 1.5 * atr_val, 5)
-        tp2   = round(entry + 3.0 * atr_val, 5)
-        tp3   = round(entry + 4.5 * atr_val, 5)
-        rr    = round((tp1 - entry) / (entry - sl), 2) if (entry - sl) != 0 else 0
-    elif main_signal == 'SELL':
-        entry = current_price
-        sl    = round(entry + 1.5 * atr_val, 5)
-        tp1   = round(entry - 1.5 * atr_val, 5)
-        tp2   = round(entry - 3.0 * atr_val, 5)
-        tp3   = round(entry - 4.5 * atr_val, 5)
-        rr    = round((entry - tp1) / (sl - entry), 2) if (sl - entry) != 0 else 0
+    # ── نقاط الدخول والخروج (بسعر السوق الحقيقي) ──
+    spread = cur_atr*0.05      # تقدير السبريد
+    if signal=="BUY":
+        entry = round(price + spread, 5)          # سعر الشراء الفعلي
+        sl    = round(entry - 2.0*cur_atr, 5)
+        tp1   = round(entry + 1.5*cur_atr, 5)
+        tp2   = round(entry + 3.0*cur_atr, 5)
+        tp3   = round(entry + 5.0*cur_atr, 5)
+    elif signal=="SELL":
+        entry = round(price - spread, 5)          # سعر البيع الفعلي
+        sl    = round(entry + 2.0*cur_atr, 5)
+        tp1   = round(entry - 1.5*cur_atr, 5)
+        tp2   = round(entry - 3.0*cur_atr, 5)
+        tp3   = round(entry - 5.0*cur_atr, 5)
     else:
-        entry = current_price
-        sl    = round(current_price - atr_val, 5)
-        tp1   = round(current_price + atr_val, 5)
-        tp2   = round(current_price + 2 * atr_val, 5)
-        tp3   = round(current_price + 3 * atr_val, 5)
-        rr    = 1.0
+        entry=price; sl=price-cur_atr; tp1=price+cur_atr
+        tp2=price+2*cur_atr; tp3=price+3*cur_atr
+    sl_pips = round(abs(entry-sl)/cur_atr*100,1)
+    rr = round(abs(tp1-entry)/abs(entry-sl),2) if abs(entry-sl)>0 else 1.0
 
-    # ===== CANDLE PATTERN =====
-    if body_ratio < 0.1:
-        candle_pattern = 'Doji (تردد)'
-    elif body_ratio > 0.7:
-        candle_pattern = 'Marubozu - قوي جداً'
-    elif wick_ratio > 0.6 and is_bullish_candle:
-        candle_pattern = 'Hammer (ارتداد صعودي)'
-    elif upper_wick > lower_wick * 2 and not is_bullish_candle:
-        candle_pattern = 'Shooting Star (ارتداد هبوطي)'
-    elif body_ratio > 0.4:
-        candle_pattern = 'Standard ' + ('Bullish' if is_bullish_candle else 'Bearish')
+    # ── تحليل الشمعة ──
+    cur_c  = df.iloc[-1]; prev_c = df.iloc[-2]
+    c_body = abs(float(cur_c.close)-float(cur_c.open))
+    c_rng  = float(cur_c.high)-float(cur_c.low)
+    c_br   = c_body/c_rng if c_rng>0 else 0
+    is_bull_c = float(cur_c.close)>float(cur_c.open)
+    c_uw = float(cur_c.high)-max(float(cur_c.open),float(cur_c.close))
+    c_lw = min(float(cur_c.open),float(cur_c.close))-float(cur_c.low)
+    c_pat = candle_pattern(cur_c, prev_c)
+    c_str = "قوية 💪" if c_br>0.65 else ("متوسطة" if c_br>0.38 else "ضعيفة")
+
+    # توقع الشمعة القادمة
+    if signal=="BUY":
+        next_c="🟢 صاعدة (استمرار صعود)"; next_p=confidence
+    elif signal=="SELL":
+        next_c="🔴 هابطة (استمرار هبوط)"; next_p=confidence
     else:
-        candle_pattern = 'Spinning Top (تردد)'
+        next_c="⚪ غير محدد — انتظر إغلاق الشمعة"; next_p=50
 
-    # Next candle prediction
-    if main_signal == 'BUY':
-        next_candle = '🟢 الشمعة القادمة صعودية (استمرار)'
-        next_prob = confidence
-    elif main_signal == 'SELL':
-        next_candle = '🔴 الشمعة القادمة هبوطية (استمرار)'
-        next_prob = confidence
-    else:
-        next_candle = '⚪ غير محدد - انتظر تأكيداً'
-        next_prob = 50
-
-    # Pivots & Order Blocks & Snake
-    try:
-        pivots = calc_pivot_points(df)
-    except:
-        pivots = {}
-    try:
-        obs = detect_order_blocks(df)
-    except:
-        obs = []
-    try:
-        snake_sigs = snake_strategy(df)
-        last_snake = snake_sigs[-1] if snake_sigs else None
-    except:
-        last_snake = None
+    # ── pivot + OB ──
+    try: pvt=pivot_points(df)
+    except: pvt={}
+    obs = order_blocks(df)
+    ms  = market_structure(df)
 
     return {
-        'pair':      pair,
-        'interval':  interval,
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC'),
-        'price':     round(current_price, 5),
-        'signal':    main_signal,
-        'confidence': round(confidence, 1),
-        'bull_score': bull_score,
-        'bear_score': bear_score,
-        'bull_pct':  round(bull_pct, 1),
-        'bear_pct':  round(bear_pct, 1),
-        'market_structure': market_structure,
-        'candle': {
-            'direction': '🟢 صاعدة' if is_bullish_candle else '🔴 هابطة',
-            'pattern':   candle_pattern,
-            'strength':  candle_strength,
-            'body_ratio': round(body_ratio * 100, 1),
-            'open':  round(float(cur_candle['open']), 5),
-            'high':  round(float(cur_candle['high']), 5),
-            'low':   round(float(cur_candle['low']), 5),
-            'close': round(float(cur_candle['close']), 5),
-            'upper_wick': round(upper_wick, 5),
-            'lower_wick': round(lower_wick, 5),
+        "pair":      pair,
+        "interval":  interval,
+        "htf":       htf,
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "price":     round(price,5),
+        "signal":    signal,          # BUY / SELL / WAIT
+        "confidence":confidence,
+        "quality":   quality,
+        "bull_score":bull,"bear_score":bear,
+        "bull_pct":  round(bull_pct,1),"bear_pct":round(bear_pct,1),
+        "htf_confirm":htf_confirm,
+        "agreement_bull":agreement_bull,"agreement_bear":agreement_bear,
+        "market_structure":ms,
+        "trade":{
+            "entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,
+            "rr":rr,"sl_pips":sl_pips,
+            "direction":"LONG 📈" if signal=="BUY" else ("SHORT 📉" if signal=="SELL" else "لا صفقة"),
+            "size_note":"حجم اللوت حسب إدارة رأس المال (1-2% خطر)"
         },
-        'next_candle':      next_candle,
-        'next_candle_prob': next_prob,
-        'trade': {
-            'entry': round(entry, 5),
-            'sl':    round(sl, 5),
-            'tp1':   round(tp1, 5),
-            'tp2':   round(tp2, 5),
-            'tp3':   round(tp3, 5),
-            'rr':    rr,
+        "candle":{
+            "direction":"🟢 صاعدة" if is_bull_c else "🔴 هابطة",
+            "pattern":c_pat,"strength":c_str,
+            "body_pct":round(c_br*100,1),
+            "open":round(float(cur_c.open),5),"high":round(float(cur_c.high),5),
+            "low":round(float(cur_c.low),5),"close":round(float(cur_c.close),5),
+            "upper_wick":round(c_uw,5),"lower_wick":round(c_lw,5),
         },
-        'indicators': {
-            'ema9':         round(cur_ema9, 5),
-            'ema21':        round(cur_ema21, 5),
-            'ema50':        round(cur_ema50, 5),
-            'ema200':       round(cur_ema200, 5),
-            'rsi':          round(cur_rsi, 2),
-            'stoch_k':      round(stoch_k, 2),
-            'stoch_d':      round(stoch_d, 2),
-            'macd':         round(cur_macd, 5),
-            'macd_signal':  round(cur_macd_s, 5),
-            'macd_hist':    round(cur_macd_h, 5),
-            'atr':          round(cur_atr, 5),
-            'vwap':         round(cur_vwap, 5),
-            'bb_upper':     round(cur_bb_up, 5),
-            'bb_mid':       round(cur_bb_mid, 5),
-            'bb_lower':     round(cur_bb_low, 5),
-            'supertrend_dir': cur_st_dir,
+        "next_candle":next_c,"next_candle_prob":next_p,
+        "indicators":{
+            "ema9":round(main["e9"],5),"ema21":round(main["e21"],5),
+            "ema50":round(main["e50"],5),"ema200":round(main["e200"],5),
+            "rsi":round(main["rsi"],2),
+            "stoch_k":round(main["stoch_k"],2),"stoch_d":round(main["stoch_d"],2),
+            "macd":round(main["macd"],5),"macd_signal":round(main["macd_sig"],5),
+            "macd_hist":round(main["macd_hist"],5),
+            "atr":round(cur_atr,5),"vwap":round(main["vwap"],5),
+            "bb_upper":round(main["bb_u"],5),"bb_mid":round(main["bb_m"],5),
+            "bb_lower":round(main["bb_l"],5),
+            "supertrend_dir":main["st_dir"],
         },
-        'signals_breakdown': signals_list,
-        'pivot_points':  pivots,
-        'order_blocks':  obs,
-        'snake_signal':  last_snake,
-        'mt5_symbol':    pair,
+        "signals_breakdown":reasons,
+        "pivot_points":pvt,"order_blocks":obs,
+        "snake_signal":snake_info,
     }
 
-# ============================================================
-# FLASK ROUTES
-# ============================================================
+# ─────────────────────────────────────────────
+# 5.  Flask Routes
+# ─────────────────────────────────────────────
+PAIRS     = ["XAUUSD","BTCUSD","EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","NZDUSD","USDCAD"]
+INTERVALS = ["5m","15m","30m","1h","4h","1d"]
 
-PAIRS     = ['XAUUSD', 'BTCUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'NZDUSD', 'USDCAD']
-INTERVALS = ['5m', '15m', '30m', '1h', '4h', '1d']
-
-@app.route('/')
+@app.route("/")
 def index():
-    return render_template('index.html', pairs=PAIRS, intervals=INTERVALS)
+    return render_template("index.html", pairs=PAIRS, intervals=INTERVALS)
 
-@app.route('/api/signal')
+@app.route("/api/signal")
 def api_signal():
-    pair     = request.args.get('pair', 'XAUUSD')
-    interval = request.args.get('interval', '1h')
-    result   = generate_signal(pair, interval)
-    return jsonify(result)
+    pair     = request.args.get("pair","XAUUSD")
+    interval = request.args.get("interval","1h")
+    return jsonify(generate_signal(pair, interval))
 
-@app.route('/api/multi_signal')
-def api_multi_signal():
-    interval = request.args.get('interval', '1h')
-    results  = []
-    for pair in ['XAUUSD', 'BTCUSD', 'EURUSD', 'GBPUSD', 'USDJPY']:
+@app.route("/api/multi_signal")
+def api_multi():
+    iv = request.args.get("interval","1h")
+    out=[]
+    for p in ["XAUUSD","BTCUSD","EURUSD","GBPUSD","USDJPY"]:
         try:
-            r = generate_signal(pair, interval)
-            if 'error' not in r:
-                results.append(r)
+            r=generate_signal(p,iv)
+            if "error" not in r: out.append(r)
         except Exception as e:
-            results.append({'pair': pair, 'error': str(e)})
-    return jsonify(results)
+            out.append({"pair":p,"error":str(e)})
+    return jsonify(out)
 
-@app.route('/api/health')
+@app.route("/api/health")
 def health():
-    return jsonify({'status': 'ok', 'timestamp': datetime.now().isoformat()})
+    return jsonify({"status":"ok","time":datetime.utcnow().isoformat()})
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+if __name__=="__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
